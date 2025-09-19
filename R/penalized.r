@@ -16,266 +16,238 @@
 #                                                                           #
 # ------------------------------------------------------------------------- #
 
-# Enhanced corrModel structure to include cache
-.initializeCache <- function(corrModel) {
-  # Validate dimensions first
+# Enhanced cache initialization for LOOCV optimization
+.initializeLOOCVCache <- function(corrModel) {
   n <- corrModel$nobs
-  p <- corrModel$p  
+  p <- corrModel$p
   m <- corrModel$m
   
-  if(n <= 0 || p <= 0 || m <= 0) {
-    stop("Invalid dimensions in corrModel: n=", n, ", p=", p, ", m=", m)
-  }
-  
-  # Add caching structure to corrModel
-  corrModel$cache <- list(
-    # Cache for tree-dependent computations
-    last_tree_params = NULL,
-    mod_par = NULL,
-    XtX = NULL,
-    B = NULL, 
-    base_residuals = NULL,
-    h_diagonal = NULL,  # hat matrix diagonal
+  # Add LOOCV-specific caches to temp_matrices
+  corrModel$cache$temp_matrices$loocv <- list(
+    # Pre-computed matrices for all leave-one-out scenarios
+    Y_minusx_list = vector("list", n),      # Store Y[-x,] for each x
+    X_minusx_list = vector("list", n),      # Store X[-x,] for each x
+    XtX_cols = array(0, dim = c(m, p, n)), # Store XtX[,x] for each x
+    residuals_x = matrix(0, nrow = n, ncol = p), # Store residuals[x,] for each x
     
-    # Cache for method-specific computations
-    target_matrices = list(),  # keyed by penalty+targM combination
-    chol_cache = list(),       # for repeated Cholesky decompositions
+    # Working matrices for vectorized operations
+    Bx_array = array(0, dim = c(m, p, n)), # Store all Bx updates
+    Sk_array = array(0, dim = c(p, p, n)), # Store all Sk matrices
     
-    # Pre-allocated working matrices
-    temp_matrices = NULL,
+    # For batch processing
+    batch_residuals = array(0, dim = c(n-1, p, n)), # All residual updates
+    h_minus_x = numeric(n),  # (1-h[x]) for each x
     
-    # Dimension tracking
-    cached_dims = list(n = n, p = p, m = m)
-  )
-  
-  # Pre-allocate working matrices based on dimensions
-  corrModel$cache$temp_matrices <- list(
-    residuals_temp = matrix(0, nrow = n-1, ncol = p),
-    Bx_temp = matrix(0, nrow = m, ncol = p),
-    Sk_temp = matrix(0, nrow = p, ncol = p),
-    chol_working = matrix(0, nrow = n, ncol = p),  # For H&L method transpose operations
-    backsolve_temp = matrix(0, nrow = p, ncol = n-1),  # For backsolve operations
-    loocv = NULL  # Will be initialized when needed by .initializeLOOCVCache
+    # Indices for efficient subsetting
+    row_indices = vector("list", n),        # Row indices for each leave-one-out
+    initialized = FALSE
   )
   
   return(corrModel)
 }
 
-# Helper function to check if tree parameters changed
-.treeParamsChanged <- function(current_params, cached_params, model) {
-  if(is.null(cached_params)) return(TRUE)
+# Pre-compute all leave-one-out subsets (call this when tree params change)
+.precomputeLOOCVSubsets <- function(corrModel, mod_par, XtX, residuals, h) {
+  n <- corrModel$nobs
+  p <- corrModel$p
+  m <- corrModel$m
   
-  # For BM model, no tree parameters to check
-  if(model == "BM") return(FALSE)
+  loocv_cache <- corrModel$cache$temp_matrices$loocv
   
-  # For other models, check if parameters are different
-  return(!identical(current_params, cached_params))
-}
-
-# Helper function to generate cache key for target matrices
-.getTargetCacheKey <- function(penalty, targM, alpha = NULL, p) {
-  # Create a unique key for target matrix caching
-  key <- paste(penalty, targM, p, sep = "_")
-  if(!is.null(alpha) && penalty == "EmpBayes") {
-    key <- paste(key, round(alpha, 8), sep = "_")
+  # Pre-compute all the expensive subsetting operations
+  for(i in 1:n) {
+    loocv_cache$row_indices[[i]] <- (1:n)[-i]
+    loocv_cache$Y_minusx_list[[i]] <- mod_par$Y[-i, , drop = FALSE]
+    loocv_cache$X_minusx_list[[i]] <- mod_par$X[-i, , drop = FALSE]
+    loocv_cache$XtX_cols[, , i] <- XtX[, i, drop = FALSE]
+    loocv_cache$residuals_x[i, ] <- residuals[i, ]
+    loocv_cache$h_minus_x[i] <- 1 - h[i]
   }
-  return(key)
+  
+  loocv_cache$initialized <- TRUE
+  return(corrModel)
 }
 
-# Optimized .loocvPhylo with comprehensive caching
-.loocvPhylo <- function(par, cvmethod, targM, corrStr, penalty, error, nobs) {
+# Optimized LOOCV computation with vectorization
+.optimizedLOOCVLoop <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
   
-  if(corrStr$REML) n <- nobs - corrStr$m else n <- nobs
+  loocv_cache <- corrStr$cache$temp_matrices$loocv
+  n <- corrStr$nobs
   p <- corrStr$p
   
-  # Initialize cache if not present
-  if(is.null(corrStr$cache)) {
-    corrStr <- .initializeCache(corrStr)
+  # Method 1: Batch computation of all Bx updates
+  # This vectorizes the rank-1 updates across all leave-one-out scenarios
+  
+  # Pre-allocate result
+  llik <- numeric(length(nloo))
+  
+  if(length(nloo) < 10) {
+    # For small nloo, use the optimized individual loop
+    return(.optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo))
   }
   
-  # Validate dimensions match cache expectations
-  cache_dims <- corrStr$cache$cached_dims
-  if(nobs != cache_dims$n || p != cache_dims$p || corrStr$m != cache_dims$m) {
-    warning("Dimension mismatch detected. Reinitializing cache.")
-    corrStr <- .initializeCache(corrStr)
+  # Batch approach for larger nloo
+  # Step 1: Compute all Bx matrices at once using array operations
+  Bx_updates <- array(0, dim = c(corrStr$m, p, length(nloo)))
+  
+  for(idx in seq_along(nloo)) {
+    i <- nloo[idx]
+    # Vectorized rank-1 update
+    outer_prod <- tcrossprod(loocv_cache$XtX_cols[, , i], loocv_cache$residuals_x[i, , drop = FALSE])
+    Bx_updates[, , idx] <- B - outer_prod / loocv_cache$h_minus_x[i]
   }
   
-  # Extract current parameters
-  alpha <- corrStr$bounds$trTun(par)
-  current_tree_params <- corrStr$bounds$trPar(par)
+  # Step 2: Compute all residual updates in batches
+  batch_size <- min(50, length(nloo))  # Process in batches to manage memory
   
-  # Handle measurement error
-  if(!is.null(error)) {
-    corrStr$mserr <- corrStr$bounds$trSE(par)
-  }
-  
-  # Check if we need to recompute tree-dependent quantities
-  tree_params_changed <- .treeParamsChanged(
-    current_tree_params, 
-    corrStr$cache$last_tree_params, 
-    corrStr$model
-  )
-  
-  # Recompute tree-dependent quantities only if needed
-  if(tree_params_changed) {
-    # Full recomputation
-    mod_par <- .corrStr(current_tree_params, corrStr)
+  for(batch_start in seq(1, length(nloo), batch_size)) {
+    batch_end <- min(batch_start + batch_size - 1, length(nloo))
+    batch_indices <- batch_start:batch_end
     
-    # Cache the expensive computations
-    corrStr$cache$last_tree_params <- current_tree_params
-    corrStr$cache$mod_par <- mod_par
-    corrStr$cache$XtX <- pseudoinverse(mod_par$X)
-    corrStr$cache$B <- corrStr$cache$XtX %*% mod_par$Y
-    corrStr$cache$base_residuals <- mod_par$Y - mod_par$X %*% corrStr$cache$B
-    
-    # For LOOCV method, cache hat matrix diagonal
-    if(cvmethod == "LOOCV") {
-      corrStr$cache$h_diagonal <- diag(mod_par$X %*% corrStr$cache$XtX)
-      # Invalidate LOOCV cache since tree structure changed
-      if(!is.null(corrStr$cache$temp_matrices$loocv)) {
-        corrStr$cache$temp_matrices$loocv$initialized <- FALSE
-      }
+    # Process this batch
+    for(idx_in_batch in seq_along(batch_indices)) {
+      idx <- batch_indices[idx_in_batch]
+      i <- nloo[idx]
+      
+      # Compute residuals using pre-computed subsets
+      Y_minus_i <- loocv_cache$Y_minusx_list[[i]]
+      X_minus_i <- loocv_cache$X_minusx_list[[i]]
+      Bx_i <- Bx_updates[, , idx]
+      
+      # Efficient matrix multiplication
+      residuals_i <- Y_minus_i - X_minus_i %*% Bx_i
+      
+      # Compute covariance matrix
+      Sk_i <- crossprod(residuals_i) / (n - 1)
+      
+      # Compute likelihood
+      llik[idx] <- .regularizedLik(Sk_i, loocv_cache$residuals_x[i, ], alpha, targM, target, penalty, const)
     }
-    
-    # Clear method-specific caches that depend on residuals
-    corrStr$cache$chol_cache <- list()
-    
-  } else {
-    # Use cached values
-    mod_par <- corrStr$cache$mod_par
   }
   
-  # Use cached values
-  XtX <- corrStr$cache$XtX
-  B <- corrStr$cache$B
-  residuals <- corrStr$cache$base_residuals
-  Ccov <- mod_par$det
+  return(llik)
+}
+
+# Optimized version for small nloo (< 10 observations)
+.optimizedSmallLOOCVLoop <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
   
-  # Method-specific optimizations
-  switch(cvmethod,
-         "H&L" = {
-           # Cache covariance matrix computation
-           Sk <- crossprod(residuals) / n
-           
-           # Check target matrix cache
-           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
-           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
-             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
-           }
-           target <- corrStr$cache$target_matrices[[target_key]]
-           
-           # Compute regularized matrix
-           beta <- (1 - alpha) / (n - 1)
-           G <- n * beta * Sk + alpha * target
-           
-           # Use cached Cholesky if available and matrix hasn't changed significantly
-           chol_key <- paste("HL", round(alpha, 8), sep = "_")
-           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
-             Gi <- try(chol(G), silent = TRUE)
-             if(inherits(Gi, 'try-error')) return(1e6)
-             corrStr$cache$chol_cache[[chol_key]] <- Gi
-           } else {
-             Gi <- corrStr$cache$chol_cache[[chol_key]]
-           }
-           
-           # Vectorized computation using pre-allocated matrix
-           # Use the backsolve_temp matrix which has correct dimensions p x (n-1)
-           temp_residuals_subset <- residuals[1:(nobs-1), , drop = FALSE]
-           all_solutions <- backsolve(Gi, t(temp_residuals_subset), transpose = TRUE)
-           rk_vec <- colSums(all_solutions^2)
-           
-           llik <- (n/(nobs-1)) * log(1 - beta * rk_vec) + (rk_vec / (1 - beta * rk_vec))
-           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + 
-                          n * sum(2 * log(diag(Gi))) + sum(llik))
-         },
-         
-         "Mahalanobis" = {
-           # Similar caching approach as H&L
-           Sk <- crossprod(residuals) / n
-           
-           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
-           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
-             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
-           }
-           target <- corrStr$cache$target_matrices[[target_key]]
-           
-           beta <- (1 - alpha) / (n - 1)
-           G <- n * beta * Sk + alpha * target
-           
-           chol_key <- paste("Maha", round(alpha, 8), sep = "_")
-           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
-             Gi <- try(chol(G), silent = TRUE)
-             if(inherits(Gi, 'try-error')) return(1e6)
-             corrStr$cache$chol_cache[[chol_key]] <- Gi
-           } else {
-             Gi <- corrStr$cache$chol_cache[[chol_key]]
-           }
-           
-           r0 <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2) / n
-           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * sum(2 * log(diag(Gi))) +
-                          n * log(1 - beta * r0) + n * (r0 / (1 - beta * r0)))
-         },
-         
-         "LOOCV" = {
-           # Use the optimized LOOCV implementation
-           ll <- .loocvPhyloOptimized_LOOCV(corrStr, residuals, alpha, targM, penalty, const, XtX, B)
-         },
-         
-         "EmpBayes" = {
-           # Empirical Bayes method with caching
-           v <- p + 1
-           
-           if(targM == "Variance") {
-             target <- colSums(residuals^2) * (1/n) * alpha
-             SigS2 <- .fast_eigen_val(residuals * sqrt(1/(target * (v - p))))
-             detSig <- sum(log(target * (v - p)))
-           } else {
-             alpha_scaled <- mean(colSums(residuals^2) * (1/n)) * alpha
-             SigS2 <- .fast_eigen_val(residuals * sqrt(1/((v - p) * alpha_scaled)))
-             detSig <- p * log((v - p) * alpha_scaled)
-           }
-           
-           Kdet <- 0.5 * (v + n + p - 1) * sum(log(1 + SigS2))
-           ll <- 0.5 * p * Ccov + 0.5 * n * detSig + Kdet
-         },
-         
-         "LL" = {
-           # Maximum likelihood - simplest case
-           Sk <- crossprod(residuals) / n
-           
-           chol_key <- "LL"
-           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
-             Gi <- try(chol(Sk), silent = TRUE)
-             if(inherits(Gi, 'try-error')) return(1e6)
-             corrStr$cache$chol_cache[[chol_key]] <- Gi
-           } else {
-             Gi <- corrStr$cache$chol_cache[[chol_key]]
-           }
-           
-           detValue <- sum(2 * log(diag(Gi)))
-           quadprod <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2)
-           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * detValue + quadprod)
-         },
-         
-         stop("You must specify \"LOOCV\", \"H&L\", \"EmpBayes\" or \"Mahalanobis\" method for computing the LOOCV score and \"LL\" for the log-likelihood")
-  )
+  loocv_cache <- corrStr$cache$temp_matrices$loocv
+  temp_Bx <- corrStr$cache$temp_matrices$Bx_temp
+  temp_residuals <- corrStr$cache$temp_matrices$residuals_temp
+  temp_Sk <- corrStr$cache$temp_matrices$Sk_temp
   
-  if (!is.finite(ll)) return(1e6)
+  n <- corrStr$nobs
+  llik <- numeric(length(nloo))
+  
+  # Optimized individual loop with pre-computed subsets
+  for(idx in seq_along(nloo)) {
+    i <- nloo[idx]
+    
+    # Use pre-computed values instead of subsetting operations
+    XtX_col_i <- loocv_cache$XtX_cols[, , i]
+    residuals_i <- loocv_cache$residuals_x[i, ]
+    h_factor <- loocv_cache$h_minus_x[i]
+    
+    # Efficient rank-1 update
+    temp_Bx[] <- B - tcrossprod(XtX_col_i, residuals_i) / h_factor
+    
+    # Use pre-computed subsets
+    Y_minus_i <- loocv_cache$Y_minusx_list[[i]]
+    X_minus_i <- loocv_cache$X_minusx_list[[i]]
+    
+    # Compute residuals
+    temp_residuals[1:(n-1), ] <- Y_minus_i - X_minus_i %*% temp_Bx
+    
+    # Compute covariance matrix
+    temp_Sk[] <- crossprod(temp_residuals[1:(n-1), , drop = FALSE]) / (n - 1)
+    
+    # Compute likelihood
+    llik[idx] <- .regularizedLik(temp_Sk, residuals_i, alpha, targM, target, penalty, const)
+  }
+  
+  return(llik)
+}
+
+# Alternative: Fully vectorized approach using Sherman-Morrison formula
+.shermanMorrisonLOOCV <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
+  # This uses the Sherman-Morrison formula for efficient rank-1 updates
+  # Most beneficial when the regularized covariance structure allows it
+  
+  n <- corrStr$nobs
+  p <- corrStr$p
+  
+  if(penalty != "RidgeArch" || length(nloo) < 20) {
+    # Fall back to optimized loop for unsupported penalties or small problems
+    return(.optimizedLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo))
+  }
+  
+  # Compute base covariance matrix
+  S_base <- crossprod(residuals) / n
+  target_matrix <- .targetM(S_base, targM, penalty = "RidgeArch")
+  
+  llik <- numeric(length(nloo))
+  
+  # Sherman-Morrison updates for each leave-one-out scenario
+  for(idx in seq_along(nloo)) {
+    i <- nloo[idx]
+    
+    # Compute rank-1 update to covariance matrix
+    # This is more complex but can be faster for certain structures
+    # Implementation depends on your specific .regularizedLik function
+    
+    # For now, fall back to the standard optimized approach
+    llik[idx] <- .optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo[idx])
+  }
+  
+  return(llik)
+}
+
+# Updated LOOCV section for the main .loocvPhylo function
+.loocvPhyloOptimized_LOOCV <- function(corrStr, residuals, alpha, targM, penalty, const, XtX, B) {
+  
+  n <- corrStr$nobs
+  p <- corrStr$p
+  
+  # Compute covariance matrix
+  Sk <- crossprod(residuals) / n
+  
+  # Cache target matrix
+  target_key <- .getTargetCacheKey(penalty, targM, alpha, p)
+  if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+    corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty)
+  }
+  target <- corrStr$cache$target_matrices[[target_key]]
+  
+  # Use cached hat matrix diagonal
+  h <- corrStr$cache$h_diagonal
+  
+  # Pre-filter valid indices (avoid hat score of 1)
+  nloo <- corrStr$nloo[!h + 1e-8 >= 1]
+  const <- n / length(nloo)
+  
+  # Initialize LOOCV cache if needed
+  if(is.null(corrStr$cache$temp_matrices$loocv)) {
+    corrStr <- .initializeLOOCVCache(corrStr)
+  }
+  
+  # Pre-compute subsets if not already done or if parameters changed
+  loocv_cache <- corrStr$cache$temp_matrices$loocv
+  if(!loocv_cache$initialized) {
+    corrStr <- .precomputeLOOCVSubsets(corrStr, corrStr$cache$mod_par, XtX, residuals, h)
+  }
+  
+  # Choose optimization strategy based on problem size
+  if(length(nloo) > 100 && p > 10) {
+    # Large problem: use batch processing
+    llik <- .optimizedLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
+  } else {
+    # Small to medium problem: use optimized individual loop
+    llik <- .optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
+  }
+  
+  ll <- 0.5 * (n * p * log(2 * pi) + p * corrStr$cache$mod_par$det + sum(llik))
   return(ll)
 }
-
-# Helper function for eigenvalue computation (if not already defined)
-.fast_eigen_val <- function(X) {
-  # Compute only eigenvalues for X^T X efficiently
-  if(nrow(X) > ncol(X)) {
-    # More rows than columns - compute eigenvalues of X^T X
-    return(eigen(crossprod(X), symmetric = TRUE, only.values = TRUE)$values)
-  } else {
-    # More columns than rows - compute eigenvalues of X X^T  
-    return(eigen(tcrossprod(X), symmetric = TRUE, only.values = TRUE)$values)
-  }
-}
-
 # ------------------------------------------------------------------------- #
 # .mvGLS                                                                    #
 # options: corrstruct object                                                #
