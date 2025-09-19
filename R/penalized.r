@@ -205,14 +205,11 @@
 # Updated LOOCV section for the main .loocvPhylo function
 .loocvPhyloOptimized_LOOCV <- function(corrStr, residuals, alpha, targM, penalty, const, XtX, B) {
   
-  n <- corrStr$nobs
-  p <- corrStr$p
-  
   # Compute covariance matrix
-  Sk <- crossprod(residuals) / n
+  Sk <- crossprod(residuals) / corrStr$nobs
   
   # Cache target matrix
-  target_key <- .getTargetCacheKey(penalty, targM, alpha, p)
+  target_key <- .getTargetCacheKey(penalty, targM, alpha, corrStr$p)
   if(is.null(corrStr$cache$target_matrices[[target_key]])) {
     corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty)
   }
@@ -223,7 +220,7 @@
   
   # Pre-filter valid indices (avoid hat score of 1)
   nloo <- corrStr$nloo[!h + 1e-8 >= 1]
-  const <- n / length(nloo)
+  const <- corrStr$nobs / length(nloo)
   
   # Initialize LOOCV cache if needed
   if(is.null(corrStr$cache$temp_matrices$loocv)) {
@@ -237,7 +234,7 @@
   }
   
   # Choose optimization strategy based on problem size
-  if(length(nloo) > 100 && p > 10) {
+  if(length(nloo) > 100 && corrStr$p > 10) {
     # Large problem: use batch processing
     llik <- .optimizedLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
   } else {
@@ -245,9 +242,10 @@
     llik <- .optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
   }
   
-  ll <- 0.5 * (n * p * log(2 * pi) + p * corrStr$cache$mod_par$det + sum(llik))
+  ll <- 0.5 * (corrStr$nobs * corrStr$p * log(2 * pi) + corrStr$p * corrStr$cache$mod_par$det + sum(llik))
   return(ll)
 }
+
 # ------------------------------------------------------------------------- #
 # .mvGLS                                                                    #
 # options: corrstruct object                                                #

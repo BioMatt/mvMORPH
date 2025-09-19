@@ -118,7 +118,7 @@ mvgls <- function(formula, data=list(), tree, model, method=c("PL-LOOCV","LL"), 
                     model=model, structure=tree, p=p, nobs=nobs, m=m,
                     nloo=nloo, precalc=precalc)
     
-    corrModel <- .initializeCache(corrModel) # Added by MT
+    corrModel <- .initializeLOOCVCache(corrModel) # Added by MT
     
     # Set bounds for parameter search
     bounds <- corrModel$bounds <- .setBounds(penalty=penalty, model=model, lower=low, upper=up, tol=tol, mserr=mserr, penalized=penalized, corrModel=corrModel, k=k)
