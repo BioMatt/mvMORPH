@@ -54,7 +54,8 @@
     Bx_temp = matrix(0, nrow = m, ncol = p),
     Sk_temp = matrix(0, nrow = p, ncol = p),
     chol_working = matrix(0, nrow = n, ncol = p),  # For H&L method transpose operations
-    backsolve_temp = matrix(0, nrow = p, ncol = n-1)  # For backsolve operations
+    backsolve_temp = matrix(0, nrow = p, ncol = n-1),  # For backsolve operations
+    loocv = NULL  # Will be initialized when needed by .initializeLOOCVCache
   )
   
   return(corrModel)
@@ -130,6 +131,10 @@
     # For LOOCV method, cache hat matrix diagonal
     if(cvmethod == "LOOCV") {
       corrStr$cache$h_diagonal <- diag(mod_par$X %*% corrStr$cache$XtX)
+      # Invalidate LOOCV cache since tree structure changed
+      if(!is.null(corrStr$cache$temp_matrices$loocv)) {
+        corrStr$cache$temp_matrices$loocv$initialized <- FALSE
+      }
     }
     
     # Clear method-specific caches that depend on residuals
@@ -212,51 +217,8 @@
          },
          
          "LOOCV" = {
-           # Most complex case - optimize the expensive loop
-           Sk <- crossprod(residuals) / n
-           
-           # Cache target matrix
-           target_key <- .getTargetCacheKey(penalty, targM, alpha, p)
-           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
-             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty)
-           }
-           target <- corrStr$cache$target_matrices[[target_key]]
-           
-           # Use cached hat matrix diagonal
-           h <- corrStr$cache$h_diagonal
-           
-           # Pre-filter valid indices (avoid hat score of 1)
-           nloo <- corrStr$nloo[!h + 1e-8 >= 1]
-           const <- n / length(nloo)
-           
-           # Pre-allocate for vectorized computation
-           temp_Bx <- corrStr$cache$temp_matrices$Bx_temp
-           temp_residuals <- corrStr$cache$temp_matrices$residuals_temp
-           temp_Sk <- corrStr$cache$temp_matrices$Sk_temp
-           
-           # Vectorized LOOCV loop
-           llik <- numeric(length(nloo))
-           for(i in seq_along(nloo)) {
-             x <- nloo[i]
-             
-             # Efficient rank-1 update using pre-allocated matrix
-             temp_Bx[] <- B - tcrossprod(XtX[, x, drop = FALSE], residuals[x, , drop = FALSE]) / (1 - h[x])
-             
-             # Update residuals using vectorized operations
-             mod_par_Y_minus_x <- mod_par$Y[-x, , drop = FALSE]
-             mod_par_X_minus_x <- mod_par$X[-x, , drop = FALSE]
-             
-             # Use efficient matrix multiplication
-             temp_residuals[1:(n-1), ] <- mod_par_Y_minus_x - mod_par_X_minus_x %*% temp_Bx
-             
-             # Compute partial covariance matrix
-             temp_Sk[] <- crossprod(temp_residuals[1:(n-1), , drop = FALSE]) / (n - 1)
-             
-             # Compute regularized likelihood
-             llik[i] <- .regularizedLik(temp_Sk, residuals[x, ], alpha, targM, target, penalty, const)
-           }
-           
-           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + sum(llik))
+           # Use the optimized LOOCV implementation
+           ll <- .loocvPhyloOptimized_LOOCV(corrStr, residuals, alpha, targM, penalty, const, XtX, B)
          },
          
          "EmpBayes" = {
