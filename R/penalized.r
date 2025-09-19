@@ -16,6 +16,84 @@
 #                                                                           #
 # ------------------------------------------------------------------------- #
 
+# =============================================================================
+# COMPLETE OPTIMIZED .loocvPhylo FUNCTION WITH CACHING AND VECTORIZATION
+# =============================================================================
+
+# ------------------------------------------------------------------------- #
+# Helper Functions for Caching System                                      #
+# ------------------------------------------------------------------------- #
+
+# Enhanced corrModel structure to include cache
+.initializeCache <- function(corrModel) {
+  # Validate dimensions first
+  n <- corrModel$nobs
+  p <- corrModel$p  
+  m <- corrModel$m
+  
+  if(n <= 0 || p <= 0 || m <= 0) {
+    stop("Invalid dimensions in corrModel: n=", n, ", p=", p, ", m=", m)
+  }
+  
+  # Add caching structure to corrModel
+  corrModel$cache <- list(
+    # Cache for tree-dependent computations
+    last_tree_params = NULL,
+    mod_par = NULL,
+    XtX = NULL,
+    B = NULL, 
+    base_residuals = NULL,
+    h_diagonal = NULL,  # hat matrix diagonal
+    
+    # Cache for method-specific computations
+    target_matrices = list(),  # keyed by penalty+targM combination
+    chol_cache = list(),       # for repeated Cholesky decompositions
+    
+    # Pre-allocated working matrices
+    temp_matrices = NULL,
+    
+    # Dimension tracking
+    cached_dims = list(n = n, p = p, m = m)
+  )
+  
+  # Pre-allocate working matrices based on dimensions
+  corrModel$cache$temp_matrices <- list(
+    residuals_temp = matrix(0, nrow = n-1, ncol = p),
+    Bx_temp = matrix(0, nrow = m, ncol = p),
+    Sk_temp = matrix(0, nrow = p, ncol = p),
+    chol_working = matrix(0, nrow = n, ncol = p),  # For H&L method transpose operations
+    backsolve_temp = matrix(0, nrow = p, ncol = n-1),  # For backsolve operations
+    loocv = NULL  # Will be initialized when needed by .initializeLOOCVCache
+  )
+  
+  return(corrModel)
+}
+
+# Helper function to check if tree parameters changed
+.treeParamsChanged <- function(current_params, cached_params, model) {
+  if(is.null(cached_params)) return(TRUE)
+  
+  # For BM model, no tree parameters to check
+  if(model == "BM") return(FALSE)
+  
+  # For other models, check if parameters are different
+  return(!identical(current_params, cached_params))
+}
+
+# Helper function to generate cache key for target matrices
+.getTargetCacheKey <- function(penalty, targM, alpha = NULL, p) {
+  # Create a unique key for target matrix caching
+  key <- paste(penalty, targM, p, sep = "_")
+  if(!is.null(alpha) && penalty == "EmpBayes") {
+    key <- paste(key, round(alpha, 8), sep = "_")
+  }
+  return(key)
+}
+
+# ------------------------------------------------------------------------- #
+# Helper Functions for LOOCV Vectorization                                 #
+# ------------------------------------------------------------------------- #
+
 # Enhanced cache initialization for LOOCV optimization
 .initializeLOOCVCache <- function(corrModel) {
   n <- corrModel$nobs
@@ -68,15 +146,52 @@
   return(corrModel)
 }
 
+# Optimized version for small nloo (< 10 observations)
+.optimizedSmallLOOCVLoop <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
+  
+  loocv_cache <- corrStr$cache$temp_matrices$loocv
+  temp_Bx <- corrStr$cache$temp_matrices$Bx_temp
+  temp_residuals <- corrStr$cache$temp_matrices$residuals_temp
+  temp_Sk <- corrStr$cache$temp_matrices$Sk_temp
+  
+  n <- corrStr$nobs
+  llik <- numeric(length(nloo))
+  
+  # Optimized individual loop with pre-computed subsets
+  for(idx in seq_along(nloo)) {
+    i <- nloo[idx]
+    
+    # Use pre-computed values instead of subsetting operations
+    XtX_col_i <- loocv_cache$XtX_cols[, , i]
+    residuals_i <- loocv_cache$residuals_x[i, ]
+    h_factor <- loocv_cache$h_minus_x[i]
+    
+    # Efficient rank-1 update
+    temp_Bx[] <- B - tcrossprod(XtX_col_i, residuals_i) / h_factor
+    
+    # Use pre-computed subsets
+    Y_minus_i <- loocv_cache$Y_minusx_list[[i]]
+    X_minus_i <- loocv_cache$X_minusx_list[[i]]
+    
+    # Compute residuals
+    temp_residuals[1:(n-1), ] <- Y_minus_i - X_minus_i %*% temp_Bx
+    
+    # Compute covariance matrix
+    temp_Sk[] <- crossprod(temp_residuals[1:(n-1), , drop = FALSE]) / (n - 1)
+    
+    # Compute likelihood
+    llik[idx] <- .regularizedLik(temp_Sk, residuals_i, alpha, targM, target, penalty, const)
+  }
+  
+  return(llik)
+}
+
 # Optimized LOOCV computation with vectorization
 .optimizedLOOCVLoop <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
   
   loocv_cache <- corrStr$cache$temp_matrices$loocv
   n <- corrStr$nobs
   p <- corrStr$p
-  
-  # Method 1: Batch computation of all Bx updates
-  # This vectorizes the rank-1 updates across all leave-one-out scenarios
   
   # Pre-allocate result
   llik <- numeric(length(nloo))
@@ -128,88 +243,14 @@
   return(llik)
 }
 
-# Optimized version for small nloo (< 10 observations)
-.optimizedSmallLOOCVLoop <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
-  
-  loocv_cache <- corrStr$cache$temp_matrices$loocv
-  temp_Bx <- corrStr$cache$temp_matrices$Bx_temp
-  temp_residuals <- corrStr$cache$temp_matrices$residuals_temp
-  temp_Sk <- corrStr$cache$temp_matrices$Sk_temp
-  
-  n <- corrStr$nobs
-  llik <- numeric(length(nloo))
-  
-  # Optimized individual loop with pre-computed subsets
-  for(idx in seq_along(nloo)) {
-    i <- nloo[idx]
-    
-    # Use pre-computed values instead of subsetting operations
-    XtX_col_i <- loocv_cache$XtX_cols[, , i]
-    residuals_i <- loocv_cache$residuals_x[i, ]
-    h_factor <- loocv_cache$h_minus_x[i]
-    
-    # Efficient rank-1 update
-    temp_Bx[] <- B - tcrossprod(XtX_col_i, residuals_i) / h_factor
-    
-    # Use pre-computed subsets
-    Y_minus_i <- loocv_cache$Y_minusx_list[[i]]
-    X_minus_i <- loocv_cache$X_minusx_list[[i]]
-    
-    # Compute residuals
-    temp_residuals[1:(n-1), ] <- Y_minus_i - X_minus_i %*% temp_Bx
-    
-    # Compute covariance matrix
-    temp_Sk[] <- crossprod(temp_residuals[1:(n-1), , drop = FALSE]) / (n - 1)
-    
-    # Compute likelihood
-    llik[idx] <- .regularizedLik(temp_Sk, residuals_i, alpha, targM, target, penalty, const)
-  }
-  
-  return(llik)
-}
-
-# Alternative: Fully vectorized approach using Sherman-Morrison formula
-.shermanMorrisonLOOCV <- function(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo) {
-  # This uses the Sherman-Morrison formula for efficient rank-1 updates
-  # Most beneficial when the regularized covariance structure allows it
-  
-  n <- corrStr$nobs
-  p <- corrStr$p
-  
-  if(penalty != "RidgeArch" || length(nloo) < 20) {
-    # Fall back to optimized loop for unsupported penalties or small problems
-    return(.optimizedLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo))
-  }
-  
-  # Compute base covariance matrix
-  S_base <- crossprod(residuals) / n
-  target_matrix <- .targetM(S_base, targM, penalty = "RidgeArch")
-  
-  llik <- numeric(length(nloo))
-  
-  # Sherman-Morrison updates for each leave-one-out scenario
-  for(idx in seq_along(nloo)) {
-    i <- nloo[idx]
-    
-    # Compute rank-1 update to covariance matrix
-    # This is more complex but can be faster for certain structures
-    # Implementation depends on your specific .regularizedLik function
-    
-    # For now, fall back to the standard optimized approach
-    llik[idx] <- .optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo[idx])
-  }
-  
-  return(llik)
-}
-
-# Updated LOOCV section for the main .loocvPhylo function
-.loocvPhyloOptimized_LOOCV <- function(corrStr, residuals, alpha, targM, penalty, const, XtX, B) {
+# Main optimized LOOCV computation function
+.optimizedLOOCVComputation <- function(corrStr, residuals, alpha, targM, penalty, XtX, B, n, p, Ccov) {
   
   # Compute covariance matrix
-  Sk <- crossprod(residuals) / corrStr$nobs
+  Sk <- crossprod(residuals) / n
   
   # Cache target matrix
-  target_key <- .getTargetCacheKey(penalty, targM, alpha, corrStr$p)
+  target_key <- .getTargetCacheKey(penalty, targM, alpha, p)
   if(is.null(corrStr$cache$target_matrices[[target_key]])) {
     corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty)
   }
@@ -220,7 +261,7 @@
   
   # Pre-filter valid indices (avoid hat score of 1)
   nloo <- corrStr$nloo[!h + 1e-8 >= 1]
-  const <- corrStr$nobs / length(nloo)
+  const <- n / length(nloo)
   
   # Initialize LOOCV cache if needed
   if(is.null(corrStr$cache$temp_matrices$loocv)) {
@@ -234,7 +275,7 @@
   }
   
   # Choose optimization strategy based on problem size
-  if(length(nloo) > 100 && corrStr$p > 10) {
+  if(length(nloo) > 100 && p > 10) {
     # Large problem: use batch processing
     llik <- .optimizedLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
   } else {
@@ -242,7 +283,193 @@
     llik <- .optimizedSmallLOOCVLoop(corrStr, B, residuals, alpha, targM, target, penalty, const, nloo)
   }
   
-  ll <- 0.5 * (corrStr$nobs * corrStr$p * log(2 * pi) + corrStr$p * corrStr$cache$mod_par$det + sum(llik))
+  ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + sum(llik))
+  return(ll)
+}
+
+# Helper function for eigenvalue computation
+.fast_eigen_val <- function(X) {
+  # Compute only eigenvalues for X^T X efficiently
+  if(nrow(X) > ncol(X)) {
+    # More rows than columns - compute eigenvalues of X^T X
+    return(eigen(crossprod(X), symmetric = TRUE, only.values = TRUE)$values)
+  } else {
+    # More columns than rows - compute eigenvalues of X X^T  
+    return(eigen(tcrossprod(X), symmetric = TRUE, only.values = TRUE)$values)
+  }
+}
+
+# ------------------------------------------------------------------------- #
+# MAIN OPTIMIZED .loocvPhylo FUNCTION                                      #
+# options: par, cvmethod, targM, corrStr, penalty, error, nobs              #
+# ------------------------------------------------------------------------- #
+
+.loocvPhylo <- function(par, cvmethod, targM, corrStr, penalty, error, nobs){
+  
+  if(corrStr$REML) n <- nobs - corrStr$m else n <- nobs
+  p <- corrStr$p
+  
+  # Cache should already be initialized by this point
+  # Extract current parameters
+  alpha <- corrStr$bounds$trTun(par)
+  current_tree_params <- corrStr$bounds$trPar(par)
+  
+  # Handle measurement error
+  if(!is.null(error)) {
+    corrStr$mserr <- corrStr$bounds$trSE(par)
+  }
+  
+  # Check if we need to recompute tree-dependent quantities
+  tree_params_changed <- .treeParamsChanged(
+    current_tree_params, 
+    corrStr$cache$last_tree_params, 
+    corrStr$model
+  )
+  
+  # Recompute tree-dependent quantities only if needed
+  if(tree_params_changed) {
+    # Full recomputation
+    mod_par <- .corrStr(current_tree_params, corrStr)
+    
+    # Cache the expensive computations
+    corrStr$cache$last_tree_params <- current_tree_params
+    corrStr$cache$mod_par <- mod_par
+    corrStr$cache$XtX <- pseudoinverse(mod_par$X)
+    corrStr$cache$B <- corrStr$cache$XtX %*% mod_par$Y
+    corrStr$cache$base_residuals <- mod_par$Y - mod_par$X %*% corrStr$cache$B
+    
+    # For LOOCV method, cache hat matrix diagonal
+    if(cvmethod == "LOOCV") {
+      corrStr$cache$h_diagonal <- diag(mod_par$X %*% corrStr$cache$XtX)
+      # Invalidate LOOCV cache since tree structure changed
+      if(!is.null(corrStr$cache$temp_matrices$loocv)) {
+        corrStr$cache$temp_matrices$loocv$initialized <- FALSE
+      }
+    }
+    
+    # Clear method-specific caches that depend on residuals
+    corrStr$cache$chol_cache <- list()
+    
+  } else {
+    # Use cached values
+    mod_par <- corrStr$cache$mod_par
+  }
+  
+  # Use cached values
+  XtX <- corrStr$cache$XtX
+  B <- corrStr$cache$B
+  residuals <- corrStr$cache$base_residuals
+  Ccov <- mod_par$det
+  
+  # Method-specific optimizations
+  switch(cvmethod,
+         "H&L" = {
+           # Cache covariance matrix computation
+           Sk <- crossprod(residuals) / n
+           
+           # Check target matrix cache
+           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
+           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
+           }
+           target <- corrStr$cache$target_matrices[[target_key]]
+           
+           # Compute regularized matrix
+           beta <- (1 - alpha) / (n - 1)
+           G <- n * beta * Sk + alpha * target
+           
+           # Use cached Cholesky if available and matrix hasn't changed significantly
+           chol_key <- paste("HL", round(alpha, 8), sep = "_")
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(G), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
+           }
+           
+           # Vectorized computation using pre-allocated matrix
+           temp_residuals_subset <- residuals[1:(nobs-1), , drop = FALSE]
+           all_solutions <- backsolve(Gi, t(temp_residuals_subset), transpose = TRUE)
+           rk_vec <- colSums(all_solutions^2)
+           
+           llik <- (n/(nobs-1)) * log(1 - beta * rk_vec) + (rk_vec / (1 - beta * rk_vec))
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + 
+                          n * sum(2 * log(diag(Gi))) + sum(llik))
+         },
+         
+         "Mahalanobis" = {
+           # Similar caching approach as H&L
+           Sk <- crossprod(residuals) / n
+           
+           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
+           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
+           }
+           target <- corrStr$cache$target_matrices[[target_key]]
+           
+           beta <- (1 - alpha) / (n - 1)
+           G <- n * beta * Sk + alpha * target
+           
+           chol_key <- paste("Maha", round(alpha, 8), sep = "_")
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(G), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
+           }
+           
+           r0 <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2) / n
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * sum(2 * log(diag(Gi))) +
+                          n * log(1 - beta * r0) + n * (r0 / (1 - beta * r0)))
+         },
+         
+         "LOOCV" = {
+           # Use the optimized LOOCV implementation with vectorization
+           ll <- .optimizedLOOCVComputation(corrStr, residuals, alpha, targM, penalty, XtX, B, n, p, Ccov)
+         },
+         
+         "EmpBayes" = {
+           # Empirical Bayes method with caching
+           v <- p + 1
+           
+           if(targM == "Variance") {
+             target <- colSums(residuals^2) * (1/n) * alpha
+             SigS2 <- .fast_eigen_val(residuals * sqrt(1/(target * (v - p))))
+             detSig <- sum(log(target * (v - p)))
+           } else {
+             alpha_scaled <- mean(colSums(residuals^2) * (1/n)) * alpha
+             SigS2 <- .fast_eigen_val(residuals * sqrt(1/((v - p) * alpha_scaled)))
+             detSig <- p * log((v - p) * alpha_scaled)
+           }
+           
+           Kdet <- 0.5 * (v + n + p - 1) * sum(log(1 + SigS2))
+           ll <- 0.5 * p * Ccov + 0.5 * n * detSig + Kdet
+         },
+         
+         "LL" = {
+           # Maximum likelihood - simplest case
+           Sk <- crossprod(residuals) / n
+           
+           chol_key <- "LL"
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(Sk), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
+           }
+           
+           detValue <- sum(2 * log(diag(Gi)))
+           quadprod <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2)
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * detValue + quadprod)
+         },
+         
+         stop("You must specify \"LOOCV\", \"H&L\", \"EmpBayes\" or \"Mahalanobis\" method for computing the LOOCV score and \"LL\" for the log-likelihood")
+  )
+  
+  if (!is.finite(ll)) return(1e6)
   return(ll)
 }
 
@@ -967,7 +1194,7 @@
     list_param[sapply(list_param, is.null)] <- NULL
     brute_force <- expand.grid(list_param)
   }
-  
+  corrModel <- .initializeCache(corrModel) # Initialize the cache early
   start <- brute_force[which.min(apply(brute_force, 1, .loocvPhylo,
                                        cvmethod=cvmethod, # options
                                        targM=target,
