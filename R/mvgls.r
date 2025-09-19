@@ -35,7 +35,7 @@ mvgls <- function(formula, data=list(), tree, model, method=c("PL-LOOCV","LL"), 
     if(is.null(args[["MMSE"]])) MMSE <- "TRUE" else MMSE <- args$MMSE
     if(is.null(args[["FCI"]])) FCI <- "FALSE" else FCI <- args$FCI
     if(is.null(args[["comp_ll"]])) comp_ll <- "TRUE" else comp_ll <- args$comp_ll
-    
+
     # check for coercion issues
     data_format = sapply(data, function(x) inherits(x,"phylo"))
     if(any(data_format)){
@@ -117,6 +117,8 @@ mvgls <- function(formula, data=list(), tree, model, method=c("PL-LOOCV","LL"), 
     corrModel <- list(Y=Y, X=X, REML=REML, mserr=mserr,
                     model=model, structure=tree, p=p, nobs=nobs, m=m,
                     nloo=nloo, precalc=precalc)
+    
+    corrModel <- .initializeCache(corrModel) # Added by MT
     
     # Set bounds for parameter search
     bounds <- corrModel$bounds <- .setBounds(penalty=penalty, model=model, lower=low, upper=up, tol=tol, mserr=mserr, penalized=penalized, corrModel=corrModel, k=k)

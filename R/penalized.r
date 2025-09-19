@@ -3,122 +3,12 @@
 ##                       mvMORPH: penalized.r                                 ##
 ##                                                                            ##
 ##   Internal functions for penalized methods in the mvMORPH package          ##
-##   (R Torch Optimized Version)                                              ##
 ##                                                                            ##
 ##  Created by Julien Clavel - 31-07-2018                                     ##
 ##  (julien.clavel@hotmail.fr/ julien.clavel@biologie.ens.fr)                 ##
-##   require: phytools, ape, corpcor, subplex, spam, glassoFast, stats, torch ##
+##   require: phytools, ape, corpcor, subplex, spam, glassoFast, stats        ##
 ##                                                                            ##
 ################################################################################
-
-# Check if torch is available and install if needed
-if (!requireNamespace("torch", quietly = TRUE)) {
-  message("torch package not found. Installing...")
-  install.packages("torch")
-}
-
-# Load required libraries
-library(torch)
-
-# Helper function to convert R matrices to torch tensors
-.to_torch <- function(x, device = "cpu") {
-  if (is.vector(x)) {
-    torch_tensor(x, device = device, dtype = torch_float64())
-  } else {
-    torch_tensor(x, device = device, dtype = torch_float64())
-  }
-}
-
-# Helper function to convert torch tensors back to R matrices
-.from_torch <- function(x) {
-  as.matrix(as_array(x$cpu()))
-}
-
-# Optimized cross product using torch
-.torch_crossprod <- function(x, y = NULL) {
-  x_torch <- .to_torch(x)
-  if (is.null(y)) {
-    # crossprod(x) equivalent to t(x) %*% x
-    result <- torch_matmul(x_torch$t(), x_torch)
-  } else {
-    y_torch <- .to_torch(y)
-    # crossprod(x, y) equivalent to t(x) %*% y
-    result <- torch_matmul(x_torch$t(), y_torch)
-  }
-  return(.from_torch(result))
-}
-
-# Optimized transpose cross product using torch
-.torch_tcrossprod <- function(x, y = NULL) {
-  x_torch <- .to_torch(x)
-  if (is.null(y)) {
-    # tcrossprod(x) equivalent to x %*% t(x)
-    result <- torch_matmul(x_torch, x_torch$t())
-  } else {
-    y_torch <- .to_torch(y)
-    # tcrossprod(x, y) equivalent to x %*% t(y)
-    result <- torch_matmul(x_torch, y_torch$t())
-  }
-  return(.from_torch(result))
-}
-
-# Optimized Cholesky decomposition using torch
-.torch_chol <- function(x, upper = FALSE) {
-  x_torch <- .to_torch(x)
-  
-  # Use linalg_cholesky (newer function) if available, fallback to torch_cholesky
-  if (exists("linalg_cholesky")) {
-    result <- linalg_cholesky(x_torch)
-  } else {
-    result <- torch_cholesky(x_torch, upper = upper)
-  }
-  
-  return(.from_torch(result))
-}
-
-# Optimized backsolve using torch triangular solve
-.torch_backsolve <- function(r, x, upper_tri = TRUE, transpose = FALSE) {
-  r_torch <- .to_torch(r)
-  x_torch <- .to_torch(x)
-  
-  # Check if x is a vector and convert to column matrix if needed
-  was_vector <- length(dim(x)) <= 1 || (length(dim(x)) == 2 && min(dim(x)) == 1 && is.vector(x))
-  if (was_vector) {
-    if (is.vector(x)) {
-      x_torch <- x_torch$unsqueeze(-1)  # Add column dimension
-    } else if (length(dim(x)) == 2 && ncol(x) == 1) {
-      # Already a column matrix, no change needed
-    } else if (length(dim(x)) == 2 && nrow(x) == 1) {
-      x_torch <- x_torch$t()  # Convert row vector to column vector
-    }
-  }
-  
-  if (transpose) {
-    r_torch <- r_torch$t()
-    upper_tri <- !upper_tri
-  }
-  
-  # Use the newer linalg_solve_triangular 
-  result <- linalg_solve_triangular(r_torch, x_torch, upper = upper_tri)
-  
-  # Convert back to vector if input was a vector
-  result_r <- .from_torch(result)
-  if (was_vector && ncol(result_r) == 1) {
-    result_r <- as.vector(result_r)
-  }
-  
-  return(result_r)
-}
-
-# Optimized matrix multiplication using torch
-.torch_mm <- function(x, y) {
-  x_torch <- .to_torch(x)
-  y_torch <- .to_torch(y)
-  
-  # Use torch_matmul for general matrix multiplication
-  result <- torch_matmul(x_torch, y_torch)
-  return(.from_torch(result))
-}
 
 # ------------------------------------------------------------------------- #
 # .loocvPhylo                                                               #
@@ -126,144 +16,302 @@ library(torch)
 #                                                                           #
 # ------------------------------------------------------------------------- #
 
-.loocvPhylo <- function(par, cvmethod, targM, corrStr, penalty, error, nobs){
+# Enhanced corrModel structure to include cache
+.initializeCache <- function(corrModel) {
+  # Validate dimensions first
+  n <- corrModel$nobs
+  p <- corrModel$p  
+  m <- corrModel$m
   
-  if(corrStr$REML) n <- nobs-corrStr$m else n <- nobs
-  p = corrStr$p
-  # parameters
-  alpha = corrStr$bounds$trTun(par)
-  if(!is.null(error)) corrStr$mserr = corrStr$bounds$trSE(par) # /(varData / height) TODO
+  if(n <= 0 || p <= 0 || m <= 0) {
+    stop("Invalid dimensions in corrModel: n=", n, ", p=", p, ", m=", m)
+  }
   
-  # model
-  mod_par = .corrStr(corrStr$bounds$trPar(par), corrStr);
+  # Add caching structure to corrModel
+  corrModel$cache <- list(
+    # Cache for tree-dependent computations
+    last_tree_params = NULL,
+    mod_par = NULL,
+    XtX = NULL,
+    B = NULL, 
+    base_residuals = NULL,
+    h_diagonal = NULL,  # hat matrix diagonal
+    
+    # Cache for method-specific computations
+    target_matrices = list(),  # keyed by penalty+targM combination
+    chol_cache = list(),       # for repeated Cholesky decompositions
+    
+    # Pre-allocated working matrices
+    temp_matrices = NULL,
+    
+    # Dimension tracking
+    cached_dims = list(n = n, p = p, m = m)
+  )
   
-  # GLS estimates
-  XtX <- pseudoinverse(mod_par$X)
-  B <- XtX%*%mod_par$Y
-  residuals <- mod_par$Y - mod_par$X%*%B
+  # Pre-allocate working matrices based on dimensions
+  corrModel$cache$temp_matrices <- list(
+    residuals_temp = matrix(0, nrow = n-1, ncol = p),
+    Bx_temp = matrix(0, nrow = m, ncol = p),
+    Sk_temp = matrix(0, nrow = p, ncol = p),
+    chol_working = matrix(0, nrow = n, ncol = p),  # For H&L method transpose operations
+    backsolve_temp = matrix(0, nrow = p, ncol = n-1)  # For backsolve operations
+  )
+  
+  return(corrModel)
+}
+
+# Helper function to check if tree parameters changed
+.treeParamsChanged <- function(current_params, cached_params, model) {
+  if(is.null(cached_params)) return(TRUE)
+  
+  # For BM model, no tree parameters to check
+  if(model == "BM") return(FALSE)
+  
+  # For other models, check if parameters are different
+  return(!identical(current_params, cached_params))
+}
+
+# Helper function to generate cache key for target matrices
+.getTargetCacheKey <- function(penalty, targM, alpha = NULL, p) {
+  # Create a unique key for target matrix caching
+  key <- paste(penalty, targM, p, sep = "_")
+  if(!is.null(alpha) && penalty == "EmpBayes") {
+    key <- paste(key, round(alpha, 8), sep = "_")
+  }
+  return(key)
+}
+
+# Optimized .loocvPhylo with comprehensive caching
+.loocvPhylo <- function(par, cvmethod, targM, corrStr, penalty, error, nobs) {
+  
+  if(corrStr$REML) n <- nobs - corrStr$m else n <- nobs
+  p <- corrStr$p
+  
+  # Initialize cache if not present
+  if(is.null(corrStr$cache)) {
+    corrStr <- .initializeCache(corrStr)
+  }
+  
+  # Validate dimensions match cache expectations
+  cache_dims <- corrStr$cache$cached_dims
+  if(nobs != cache_dims$n || p != cache_dims$p || corrStr$m != cache_dims$m) {
+    warning("Dimension mismatch detected. Reinitializing cache.")
+    corrStr <- .initializeCache(corrStr)
+  }
+  
+  # Extract current parameters
+  alpha <- corrStr$bounds$trTun(par)
+  current_tree_params <- corrStr$bounds$trPar(par)
+  
+  # Handle measurement error
+  if(!is.null(error)) {
+    corrStr$mserr <- corrStr$bounds$trSE(par)
+  }
+  
+  # Check if we need to recompute tree-dependent quantities
+  tree_params_changed <- .treeParamsChanged(
+    current_tree_params, 
+    corrStr$cache$last_tree_params, 
+    corrStr$model
+  )
+  
+  # Recompute tree-dependent quantities only if needed
+  if(tree_params_changed) {
+    # Full recomputation
+    mod_par <- .corrStr(current_tree_params, corrStr)
+    
+    # Cache the expensive computations
+    corrStr$cache$last_tree_params <- current_tree_params
+    corrStr$cache$mod_par <- mod_par
+    corrStr$cache$XtX <- pseudoinverse(mod_par$X)
+    corrStr$cache$B <- corrStr$cache$XtX %*% mod_par$Y
+    corrStr$cache$base_residuals <- mod_par$Y - mod_par$X %*% corrStr$cache$B
+    
+    # For LOOCV method, cache hat matrix diagonal
+    if(cvmethod == "LOOCV") {
+      corrStr$cache$h_diagonal <- diag(mod_par$X %*% corrStr$cache$XtX)
+    }
+    
+    # Clear method-specific caches that depend on residuals
+    corrStr$cache$chol_cache <- list()
+    
+  } else {
+    # Use cached values
+    mod_par <- corrStr$cache$mod_par
+  }
+  
+  # Use cached values
+  XtX <- corrStr$cache$XtX
+  B <- corrStr$cache$B
+  residuals <- corrStr$cache$base_residuals
   Ccov <- mod_par$det
   
-  
-  # Switch between LOOCV approaches
+  # Method-specific optimizations
   switch(cvmethod,
-         "H&L"={
+         "H&L" = {
+           # Cache covariance matrix computation
+           Sk <- crossprod(residuals) / n
            
-           # Covariance matrix using torch optimized crossprod
-           Sk <- .torch_crossprod(residuals)/n
+           # Check target matrix cache
+           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
+           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
+           }
+           target <- corrStr$cache$target_matrices[[target_key]]
            
-           # target matrix
-           target <- .targetM(Sk, targM, penalty="RidgeArch")
+           # Compute regularized matrix
+           beta <- (1 - alpha) / (n - 1)
+           G <- n * beta * Sk + alpha * target
            
-           # Hoffbeck & Landgrebe (1996) efficient LOOCV
-           beta <- (1 - alpha)/(n - 1)
-           G <- n*beta*Sk + alpha * target
-           Gi <- try(.torch_chol(G), silent=TRUE)
-           if(inherits(Gi, 'try-error')) return(1e6)
-           
-           llik <- sapply(1:(nobs-1), function(x){
-             rk <- sum(.torch_backsolve(Gi, residuals[x,], transpose = TRUE)^2)
-             (n/(nobs-1))*log(1 - beta*rk) + (rk/(1 - beta*rk))
-           })
-           
-           ll <- 0.5 * (n*p*log(2*pi) + p*Ccov +
-                          n*sum(2*log(diag(Gi))) + sum(llik))
-         },
-         "Mahalanobis"={
-           
-           # Covariance matrix using torch optimized crossprod
-           Sk <- .torch_crossprod(residuals)/n
-           
-           # target matrix
-           target <- .targetM(Sk, targM, penalty="RidgeArch")
-           
-           # Mahalanobis approximation of the LOOCV
-           beta <- (1 - alpha)/(n - 1)
-           G <- n*beta*Sk + alpha * target
-           Gi <- try(.torch_chol(G), silent=TRUE)
-           if(inherits(Gi, 'try-error')) return(1e6)
-           r0 <- sum(.torch_backsolve(Gi, t(residuals), transpose = TRUE)^2)/n
-           
-           ll <- 0.5 * (n*p*log(2*pi) + p*Ccov + n*sum(2*log(diag(Gi))) +
-                          n*log(1 - beta*r0) + n*(r0/(1 - beta*r0)))
-         },
-         "LOOCV"={
-           
-           # Covariance matrix using torch optimized crossprod
-           Sk <- .torch_crossprod(residuals)/n
-           
-           # target matrix
-           target <- .targetM(Sk, targM, penalty)
-           
-           # hat matrix using torch optimized matrix multiplication
-           h <- diag(.torch_mm(mod_par$X, XtX))
-           
-           # check for hat score of 1 (e.g. MANOVA design)
-           nloo <- corrStr$nloo[!h+1e-8>=1]
-           const <- n/length(nloo)
-           
-           llik <- sapply(nloo, function(x){
-             Bx <- B - .torch_tcrossprod(XtX[,x], residuals[x,])/(1-h[x]) # rank-1 update
-             # update the residuals
-             residuals2 <- mod_par$Y - .torch_mm(mod_par$X, Bx)
-             Skpartial <- .torch_crossprod(residuals2[-x,])/(n-1)
-             .regularizedLik(Skpartial, residuals[x,], alpha, targM, target, penalty, const) # try instead with current residual observation?
-           })
-           
-           ll <- 0.5 * (n*p*log(2*pi) + p*Ccov + sum(llik))
-           
-         },
-         "EmpBayes"={
-           
-           v = p+1 # default df for now (TODO: optimize it?)
-           
-           ## use the smaller matrix for computing the determinant (benchmark which one is faster)
-           #if(nobs>p){
-           #  Ip <- diag(p)
-           #  SigS <- .torch_crossprod((mod_par$Y-mod_par$X%*%B)*sqrt(1/((v-p)*alpha)))
-           #  Kdet <- 0.5*(v+n+p-1)*determinant(Ip + SigS)$modulus
-           #}else{
-           #  In <- diag(nobs)
-           #  Kdet <- 0.5*(v+n+p-1)*determinant(In + .torch_tcrossprod((mod_par$Y-mod_par$X%*%B)*sqrt(1/((v-p)*alpha))))$modulus
-           #}
-           #
-           #
-           #ll <- -( lmvgamma((v+n+p-1)/2, p) - lmvgamma((v+p-1)/2, p) - 0.5*(n*p*log(pi)) -0.5*p*Ccov - 0.5*n*(p*log((v-p)*alpha)) - Kdet)
-           #
-           
-           if(targM=="Variance"){
-             target <- colSums(residuals^2)*(1/n)*alpha
-             SigS2 <- .fast_eigen_val(residuals*sqrt(1/(target*(v-p))))
-             detSig <- sum(log(target*(v-p)))
-           }else{
-             alpha = mean(colSums(residuals^2)*(1/n))*alpha
-             SigS2 <- .fast_eigen_val(residuals*sqrt(1/((v-p)*alpha)))
-             detSig <- p*log((v-p)*alpha) # note, with default df, v-p=1; but for the Matrix T formulation should be v-1
+           # Use cached Cholesky if available and matrix hasn't changed significantly
+           chol_key <- paste("HL", round(alpha, 8), sep = "_")
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(G), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
            }
            
-           Kdet <- 0.5*(v+n+p-1)*sum(log(1+SigS2))
+           # Vectorized computation using pre-allocated matrix
+           # Use the backsolve_temp matrix which has correct dimensions p x (n-1)
+           temp_residuals_subset <- residuals[1:(nobs-1), , drop = FALSE]
+           all_solutions <- backsolve(Gi, t(temp_residuals_subset), transpose = TRUE)
+           rk_vec <- colSums(all_solutions^2)
            
-           # Full likelihood
-           #ll <- -( lmvgamma((v+n+p-1)/2, p) - lmvgamma((v+p-1)/2, p) - 0.5*(n*p*log(pi)) - 0.5*p*Ccov - 0.5*n*detSig - Kdet)
-           ll <- 0.5*p*Ccov + 0.5*n*detSig + Kdet
+           llik <- (n/(nobs-1)) * log(1 - beta * rk_vec) + (rk_vec / (1 - beta * rk_vec))
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + 
+                          n * sum(2 * log(diag(Gi))) + sum(llik))
          },
-         "LL"={
+         
+         "Mahalanobis" = {
+           # Similar caching approach as H&L
+           Sk <- crossprod(residuals) / n
            
-           # Covariance matrix using torch optimized crossprod
-           Sk <- .torch_crossprod(residuals)/n
+           target_key <- .getTargetCacheKey("RidgeArch", targM, NULL, p)
+           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty = "RidgeArch")
+           }
+           target <- corrStr$cache$target_matrices[[target_key]]
            
-           # Maximum Likelihood
-           Gi <- try(.torch_chol(Sk), silent=TRUE)
-           if(inherits(Gi, 'try-error')) return(1e6)
-           detValue <- sum(2*log(diag(Gi)))
-           quadprod <- sum(.torch_backsolve(Gi, t(residuals), transpose = TRUE)^2)
-           ll <- 0.5 * (n*p*log(2*pi) + p*Ccov + n*detValue + quadprod)
+           beta <- (1 - alpha) / (n - 1)
+           G <- n * beta * Sk + alpha * target
            
+           chol_key <- paste("Maha", round(alpha, 8), sep = "_")
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(G), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
+           }
+           
+           r0 <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2) / n
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * sum(2 * log(diag(Gi))) +
+                          n * log(1 - beta * r0) + n * (r0 / (1 - beta * r0)))
          },
+         
+         "LOOCV" = {
+           # Most complex case - optimize the expensive loop
+           Sk <- crossprod(residuals) / n
+           
+           # Cache target matrix
+           target_key <- .getTargetCacheKey(penalty, targM, alpha, p)
+           if(is.null(corrStr$cache$target_matrices[[target_key]])) {
+             corrStr$cache$target_matrices[[target_key]] <- .targetM(Sk, targM, penalty)
+           }
+           target <- corrStr$cache$target_matrices[[target_key]]
+           
+           # Use cached hat matrix diagonal
+           h <- corrStr$cache$h_diagonal
+           
+           # Pre-filter valid indices (avoid hat score of 1)
+           nloo <- corrStr$nloo[!h + 1e-8 >= 1]
+           const <- n / length(nloo)
+           
+           # Pre-allocate for vectorized computation
+           temp_Bx <- corrStr$cache$temp_matrices$Bx_temp
+           temp_residuals <- corrStr$cache$temp_matrices$residuals_temp
+           temp_Sk <- corrStr$cache$temp_matrices$Sk_temp
+           
+           # Vectorized LOOCV loop
+           llik <- numeric(length(nloo))
+           for(i in seq_along(nloo)) {
+             x <- nloo[i]
+             
+             # Efficient rank-1 update using pre-allocated matrix
+             temp_Bx[] <- B - tcrossprod(XtX[, x, drop = FALSE], residuals[x, , drop = FALSE]) / (1 - h[x])
+             
+             # Update residuals using vectorized operations
+             mod_par_Y_minus_x <- mod_par$Y[-x, , drop = FALSE]
+             mod_par_X_minus_x <- mod_par$X[-x, , drop = FALSE]
+             
+             # Use efficient matrix multiplication
+             temp_residuals[1:(n-1), ] <- mod_par_Y_minus_x - mod_par_X_minus_x %*% temp_Bx
+             
+             # Compute partial covariance matrix
+             temp_Sk[] <- crossprod(temp_residuals[1:(n-1), , drop = FALSE]) / (n - 1)
+             
+             # Compute regularized likelihood
+             llik[i] <- .regularizedLik(temp_Sk, residuals[x, ], alpha, targM, target, penalty, const)
+           }
+           
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + sum(llik))
+         },
+         
+         "EmpBayes" = {
+           # Empirical Bayes method with caching
+           v <- p + 1
+           
+           if(targM == "Variance") {
+             target <- colSums(residuals^2) * (1/n) * alpha
+             SigS2 <- .fast_eigen_val(residuals * sqrt(1/(target * (v - p))))
+             detSig <- sum(log(target * (v - p)))
+           } else {
+             alpha_scaled <- mean(colSums(residuals^2) * (1/n)) * alpha
+             SigS2 <- .fast_eigen_val(residuals * sqrt(1/((v - p) * alpha_scaled)))
+             detSig <- p * log((v - p) * alpha_scaled)
+           }
+           
+           Kdet <- 0.5 * (v + n + p - 1) * sum(log(1 + SigS2))
+           ll <- 0.5 * p * Ccov + 0.5 * n * detSig + Kdet
+         },
+         
+         "LL" = {
+           # Maximum likelihood - simplest case
+           Sk <- crossprod(residuals) / n
+           
+           chol_key <- "LL"
+           if(is.null(corrStr$cache$chol_cache[[chol_key]])) {
+             Gi <- try(chol(Sk), silent = TRUE)
+             if(inherits(Gi, 'try-error')) return(1e6)
+             corrStr$cache$chol_cache[[chol_key]] <- Gi
+           } else {
+             Gi <- corrStr$cache$chol_cache[[chol_key]]
+           }
+           
+           detValue <- sum(2 * log(diag(Gi)))
+           quadprod <- sum(backsolve(Gi, t(residuals), transpose = TRUE)^2)
+           ll <- 0.5 * (n * p * log(2 * pi) + p * Ccov + n * detValue + quadprod)
+         },
+         
          stop("You must specify \"LOOCV\", \"H&L\", \"EmpBayes\" or \"Mahalanobis\" method for computing the LOOCV score and \"LL\" for the log-likelihood")
   )
   
   if (!is.finite(ll)) return(1e6)
   return(ll)
+}
+
+# Helper function for eigenvalue computation (if not already defined)
+.fast_eigen_val <- function(X) {
+  # Compute only eigenvalues for X^T X efficiently
+  if(nrow(X) > ncol(X)) {
+    # More rows than columns - compute eigenvalues of X^T X
+    return(eigen(crossprod(X), symmetric = TRUE, only.values = TRUE)$values)
+  } else {
+    # More columns than rows - compute eigenvalues of X X^T  
+    return(eigen(tcrossprod(X), symmetric = TRUE, only.values = TRUE)$values)
+  }
 }
 
 # ------------------------------------------------------------------------- #
@@ -273,9 +321,9 @@ library(torch)
 # ------------------------------------------------------------------------- #
 .mvGLS <- function(corrstruct){
   
-  # GLS Estimate using torch optimized matrix multiplication
-  B <- .torch_mm(pseudoinverse(corrstruct$X), corrstruct$Y)
-  residuals <- corrstruct$Y - .torch_mm(corrstruct$X, B)
+  # GLS Estimate
+  B <- pseudoinverse(corrstruct$X)%*%corrstruct$Y
+  residuals <- corrstruct$Y - corrstruct$X%*%B
   
   return(list(residuals=residuals, B=B))
 }
@@ -366,16 +414,16 @@ library(torch)
   switch(penalty,
          "RidgeArch"={
            G <- (1-lambda)*S + lambda*target
-           Gi <- try(.torch_chol(G), silent=TRUE)
+           Gi <- try(chol(G), silent=TRUE)
            if(inherits(Gi, 'try-error')) return(1e6)
-           rk <- sum(.torch_backsolve(Gi, residuals, transpose = TRUE)^2)
+           rk <- sum(backsolve(Gi, residuals, transpose = TRUE)^2)
            llik <- const*sum(2*log(diag(Gi))) + rk
          },
          "RidgeAlt"={
            quad <- .makePenaltyQuad(S, lambda, target, targM)
            Gi <- quad$P
            detG <- sum(log(quad$ev))
-           Swk <- .torch_tcrossprod(residuals)
+           Swk <- tcrossprod(residuals)
            rk <- sum(Swk*Gi)
            llik <- const*detG + rk
          },
@@ -383,7 +431,7 @@ library(torch)
            LASSO <- glassoFast(S, lambda, maxIt=500)
            G <- LASSO$w;
            Gi <- LASSO$wi;
-           Swk <- .torch_tcrossprod(residuals);
+           Swk <- tcrossprod(residuals);
            rk <- sum(Swk*Gi);
            llik <- const*as.numeric(determinant(G)$modulus) + rk
          })
@@ -402,7 +450,7 @@ library(torch)
   switch(targM,
          "Variance"={
            D <- (S - lambda * target)
-           D2 <- .torch_mm(D, D)
+           D2 <- D %*% D
            sqrtM <- .sqM(D2/4 + lambda * diag(nrow(S)))
            Alt <- D/2 + sqrtM
            AltInv <- (1/lambda)*(Alt - D)
@@ -415,8 +463,8 @@ library(torch)
            evalues <- sqrt(lambda + d^2/4) + d/2
            D1 <- evalues
            D2 <- 1/evalues # Inverse
-           Alt <- .torch_mm(Q, .torch_mm(diag(D1), t(Q)))
-           AltInv <- .torch_mm(Q, .torch_mm(diag(D2), t(Q)))
+           Alt <- Q %*% (D1 * t(Q))
+           AltInv <- Q %*% (D2 * t(Q))
          },
          "null"={
            eig  <- eigen(S, symmetric = TRUE)
@@ -425,8 +473,8 @@ library(torch)
            evalues <- sqrt(lambda + d^2/4) + d/2
            D1 <- evalues
            D2 <- 1/evalues
-           Alt <- .torch_mm(Q, .torch_mm(diag(D1), t(Q)))
-           AltInv <- .torch_mm(Q, .torch_mm(diag(D2), t(Q)))
+           Alt <- Q %*% (D1 * t(Q))
+           AltInv <- Q %*% (D2 * t(Q))
          }
   )
   pen <- list(S=Alt, P=AltInv, ev=evalues)
@@ -442,7 +490,7 @@ library(torch)
 .sqM <- function(x){
   if(!all(is.finite(x))) return(Inf)
   eig <- eigen(x, symmetric = TRUE)
-  sqrtM <- .torch_mm(eig$vectors, .torch_mm(diag(sqrt(eig$values)), t(eig$vectors)))
+  sqrtM <- eig$vectors %*% (sqrt(eig$values) * t(eig$vectors))
   return(sqrtM)
 }
 
@@ -455,7 +503,7 @@ library(torch)
   tol = max(dim(x))*max(eig$values)*.Machine$double.eps
   Positive = eig$values > tol
   if(sum(Positive)<length(eig$values)) warning("The phylogenetic covariance matrix was singular. Check the results carefully and consider using 'eigSqm=FALSE' option and 'error=TRUE'")
-  sqrtM <- .torch_mm(eig$vectors[,Positive,drop=FALSE], .torch_mm(diag(1/sqrt(eig$values[Positive])), t(eig$vectors[,Positive,drop=FALSE])))
+  sqrtM <- eig$vectors[,Positive,drop=FALSE] %*% ((1/sqrt(eig$values[Positive])) * t(eig$vectors[,Positive,drop=FALSE]))
   return(sqrtM)
 }
 
@@ -485,7 +533,7 @@ library(torch)
            eig <- eigen(Pi)
            V <- eig$vectors
            d <- eig$values
-           P <- .torch_mm(V, .torch_mm(diag(1/d), t(V)))
+           P <- V%*%((1/d) * t(V))
          },
          "LASSO"={
            LASSO <- glassoFast(S,tuning)
@@ -499,14 +547,14 @@ library(torch)
            eig <- eigen(Pi)
            V <- eig$vectors
            d <- eig$values
-           P <- .torch_mm(V, .torch_mm(diag(1/d), t(V)))
+           P <- V%*%((1/d) * t(V))
          },
          "LL"={
            Pi <- S
            eig <- eigen(Pi)
            V <- eig$vectors
            d <- eig$values
-           P <- .torch_mm(V, .torch_mm(diag(1/d), t(V)))
+           P <- V%*%((1/d) * t(V))
          })
   
   estimate <- list(Pinv=Pi, P=P, S=S)
@@ -567,6 +615,56 @@ library(torch)
            
            # Adjust errors
            if(!is.null(mserr)) mserr = mserr*exp(-2*param*D[descendent[extern]])
+         },
+         "OUM"={
+           # Weight matrix OUM
+           W <- .Call(mvmorph_weights, nterm=as.integer(n), epochs=precalc$epochs, lambda=param, S=1, S1=1, beta=precalc$listReg, root=as.integer(precalc$root_std))
+           
+           # transform the tree
+           D = numeric(n)
+           
+           # check first for ultrametric tree (see Ho & Ane 2014 - Systematic Biology; R code based on "phylolm" package implementation. Courtesy of L. Ho and C. Ane)
+           if(!is.ultrametric(phy)){
+             dis = node.depth.edgelength(phy) # has all nodes
+             D = max(dis[1:n]) - dis[1:n]
+             D = D - mean(D)
+             phy$edge.length[extern] <- phy$edge.length[extern] + D[descendent[extern]]
+             flag <- TRUE
+           }
+           
+           # Branching times (now the tree is ultrametric)
+           times <- branching.times(phy)
+           Tmax <- max(times)
+           # compute the branch lengths
+           if(precalc$randomRoot){
+             distRoot <-  exp(-2*param*times)
+             d1 = distRoot[parent-n]
+             d2 = numeric(N)
+             d2[extern] = exp(-2*param*D[descendent[extern]])
+             d2[!extern] = distRoot[descendent[!extern]-n]
+           }else{
+             distRoot <-  exp(-2*param*times)*(1 - exp(-2*param*(Tmax-times)))
+             d1 = distRoot[parent-n]
+             d2 = numeric(N)
+             d2[extern] = exp(-2*param*D[descendent[extern]]) * (1-exp(-2*param*(Tmax-D[descendent[extern]])))
+             d2[!extern] = distRoot[descendent[!extern]-n]
+           }
+           
+           # weights for a "3 points" structured matrix
+           diagWeight = exp(param*D)
+           phy$edge.length = (d2 - d1)/(2*param) # scale the tree for the stationary variance
+           names(diagWeight) = phy$tip.label
+           
+           # transform the variables
+           w <- 1/diagWeight
+           Y <- matrix(w*Y, nrow=n)
+           X <- matrix(w*W, nrow=n) # Here X is replaced by the weighted matrix
+           
+           # REML "constant"
+           if(REML) const <- determinant(crossprod(W))$modulus # TODO: check for n-ultrametric trees
+           
+           # Adjust errors
+           if(!is.null(mserr)) mserr = mserr*exp(-2*param*D[descendent[extern]])
            
          },
          "OUMvcv"={
@@ -574,11 +672,11 @@ library(torch)
            W <- .Call(mvmorph_weights, nterm=as.integer(n), epochs=precalc$epochs, lambda=param, S=1, S1=1, beta=precalc$listReg, root=as.integer(precalc$root_std))
            
            # REML "constant"
-           if(REML) const <- determinant(.torch_crossprod(W))$modulus # TODO: check for n-ultrametric trees
+           if(REML) const <- determinant(crossprod(W))$modulus # TODO: check for n-ultrametric trees
            
            V<-.Call("mvmorph_covar_ou_random", A=vcv.phylo(phy), alpha=param, sigma=1, PACKAGE="mvMORPH")
            
-           C<-list(sqrtM=t(.torch_chol(solve(V))), det=determinant(V)$modulus, const=const)
+           C<-list(sqrtM=t(chol(solve(V))), det=determinant(V)$modulus, const=const)
            
          },
          "OU1"={
@@ -626,7 +724,7 @@ library(torch)
            X <- matrix(w*W, nrow=n) # Here X is replaced by the weighted matrix
            
            # REML "constant"
-           if(REML) const <- determinant(.torch_crossprod(W))$modulus
+           if(REML) const <- determinant(crossprod(W))$modulus
            
            # Adjust errors
            if(!is.null(mserr)) mserr = mserr*exp(-2*param*D[descendent[extern]])
@@ -648,7 +746,7 @@ library(torch)
          },
          "OUvcv"={
            V<-.Call("mvmorph_covar_ou_fixed", A=vcv.phylo(phy), alpha=param, sigma=1, PACKAGE="mvMORPH")
-           C<-list(sqrtM=t(.torch_chol(solve(V))), det=determinant(V)$modulus)
+           C<-list(sqrtM=t(chol(solve(V))), det=determinant(V)$modulus)
          },
          "OUTS"={
            stop("Not yet implemented. The time-series models are coming soon, please be patient")
@@ -681,8 +779,8 @@ library(torch)
   }else{
     if(model!="OUvcv" & model!="OUMvcv") C <- pruning(phy, trans=FALSE) # FIXME -> to remove the call to OUvcv?
     #if(any(phy$edge.length<=.Machine$double.eps)) C<-list(sqrtM=t(.sqM1(phy)), det=determinant(vcv(phy))$modulus) # FIXME => remove problems with the pruning algorithms on zero branch lengths?
-    X <- .torch_crossprod(C$sqrtM, X)
-    Y <- .torch_crossprod(C$sqrtM, Y)
+    X <- crossprod(C$sqrtM, X)
+    Y <- crossprod(C$sqrtM, Y)
     
     # Return the determinant
     deterM <- C$det
@@ -690,7 +788,7 @@ library(torch)
   
   # Adjust the determinant for non-ultrametric OU (see Ho & Ane 2014 - Syst. Bio., p. 401)
   if(flag) deterM <- deterM + 2*sum(log(diagWeight))
-  if(REML) deterM <- deterM + determinant(.torch_crossprod(X))$modulus - const
+  if(REML) deterM <- deterM + determinant(crossprod(X))$modulus - const
   
   # Return the score, variances, and scaled tree
   return(list(phy=phy, diagWeight=diagWeight, X=X, Y=Y, det=deterM, const=const))
@@ -985,14 +1083,14 @@ library(torch)
 .rate_guess <- function(phylo, Y, X){
   # model
   C <- pruning(phylo, trans=FALSE)
-  X <- .torch_crossprod(C$sqrtM, X)
-  Y <- .torch_crossprod(C$sqrtM, Y)
+  X <- crossprod(C$sqrtM, X)
+  Y <- crossprod(C$sqrtM, Y)
   
   # GLS estimates
   XtX <- pseudoinverse(X)
-  B <- .torch_mm(XtX, Y)
-  residuals <- Y - .torch_mm(X, B)
+  B <- XtX%*%Y
+  residuals <- Y - X%*%B
   
   # Return the residuals
   return(residuals)
-} 
+}
